@@ -21,7 +21,7 @@ final class ConnectionException extends RidgeException
     {
         return new self(
             \sprintf('Error writing to socket: %s', $previous->getMessage()),
-            (int)$previous->getCode(),
+            $previous->getCode(),
             $previous
         );
     }

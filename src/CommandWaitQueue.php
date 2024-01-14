@@ -12,23 +12,23 @@ declare(strict_types=1);
 
 namespace PHPinnacle\Ridge;
 
-use Amp\Deferred;
+use Amp\DeferredFuture;
 
 final class CommandWaitQueue
 {
-    /** @var Deferred[] */
+    /** @var DeferredFuture[] */
     private array $waitingCommands = [];
 
-    public function add(Deferred $deferred): void {
+    public function add(DeferredFuture $deferred): void {
         $this->waitingCommands[spl_object_hash($deferred)] = $deferred;
-        $deferred->promise()->onResolve(function() use ($deferred) {
+        $deferred->getFuture()->finally(function() use ($deferred) {
             unset($this->waitingCommands[spl_object_hash($deferred)]);
         });
     }
 
     public function cancel(\Throwable $throwable): void {
         foreach ($this->waitingCommands as $id => $deferred) {
-            $deferred->fail($throwable);
+            $deferred->error($throwable);
             unset($this->waitingCommands[$id]);
         }
     }

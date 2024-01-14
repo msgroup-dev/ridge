@@ -12,25 +12,14 @@ declare(strict_types=1);
 
 namespace PHPinnacle\Ridge;
 
-use function Amp\asyncCall;
+use function Amp\async;
 
 final class Events
 {
-    /**
-     * @var Channel
-     */
-    private $channel;
-
-    /**
-     * @var MessageReceiver
-     */
-    private $receiver;
-
-    public function __construct(Channel $channel, MessageReceiver $receiver)
-    {
-        $this->channel = $channel;
-        $this->receiver = $receiver;
-    }
+    public function __construct(
+        private readonly Channel $channel,
+        private readonly MessageReceiver $receiver
+    ) {}
 
     public function onAck(callable $listener): self
     {
@@ -55,7 +44,7 @@ final class Events
                 }
 
                 /** @psalm-suppress MixedArgumentTypeCoercion */
-                asyncCall($listener, $message, $this->channel);
+                async($listener, $message, $this->channel);
             }
         );
 
@@ -71,7 +60,7 @@ final class Events
             $frame,
             function (Protocol\AcknowledgmentFrame $frame) use ($callback) {
                 /** @psalm-suppress MixedArgumentTypeCoercion */
-                asyncCall($callback, $frame->deliveryTag, $frame->multiple, $this->channel);
+                async($callback, $frame->deliveryTag, $frame->multiple, $this->channel);
             }
         );
     }

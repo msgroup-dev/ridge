@@ -12,15 +12,14 @@ declare(strict_types=1);
 
 namespace PHPinnacle\Ridge;
 
-use Amp\Loop;
-use Amp\MultiReasonException;
+use Amp\CompositeException;
+use Revolt\EventLoop;
 use Evenement\EventEmitterTrait;
 use PHPinnacle\Ridge\Exception\ChannelException;
 use PHPinnacle\Ridge\Exception\ConnectionException;
-use function Amp\asyncCall;
-use function Amp\call;
-use Amp\Deferred;
-use Amp\Promise;
+use function Amp\async;
+use Amp\DeferredFuture;
+use Amp\Future;
 
 final class Client
 {
@@ -35,46 +34,26 @@ final class Client
 
     private const CONNECTION_MONITOR_INTERVAL = 5000;
 
-    /**
-     * @var Config
-     */
-    private $config;
+    private int $state = self::STATE_NOT_CONNECTED;
 
     /**
-     * @var int
+     * @var array<int, Channel>
      */
-    private $state = self::STATE_NOT_CONNECTED;
+    private array $channels = [];
 
-    /**
-     * @var Channel[]
-     */
-    private $channels = [];
+    private int $nextChannelId = 1;
 
-    /**
-     * @var int
-     */
-    private $nextChannelId = 1;
+    private Connection $connection;
 
-    /**
-     * @var Connection
-     */
-    private $connection;
+    private Properties $properties;
 
-    /**
-     * @var Properties
-     */
-    private $properties;
-
-    /**
-     * @var string|null
-     */
-    private $connectionMonitorWatcherId;
+    private ?string $connectionMonitorWatcherId = null;
 
     private CommandWaitQueue $commandWaitQueue;
 
-    public function __construct(Config $config)
-    {
-        $this->config = $config;
+    public function __construct(
+        private readonly Config $config
+    ) {
         $this->commandWaitQueue = new CommandWaitQueue();
         $this->on(self::EVENT_CLOSE, function (\Throwable $exception = null) {
             if ($exception !== null) {
@@ -105,205 +84,186 @@ final class Client
     }
 
     /**
-     * @return Promise<void>
-     *
      * @throws \PHPinnacle\Ridge\Exception\ClientException
      */
-    public function connect(): Promise
+    public function connect(): void
     {
-        return call(
+        if ($this->state !== self::STATE_NOT_CONNECTED) {
+            throw Exception\ClientException::alreadyConnected();
+        }
+
+        $this->state = self::STATE_CONNECTING;
+
+        $this->connection = new Connection($this->config->uri());
+        $this->connection->once(Connection::EVENT_CLOSE, function(\Throwable $exception = null) {
+            $this->state = self::STATE_NOT_CONNECTED;
+            $this->emit(self::EVENT_CLOSE, [$exception]);
+        });
+
+        $this->connection->open(
+            $this->config->timeout,
+            $this->config->tcpAttempts,
+            $this->config->tcpNoDelay
+        );
+
+        $buffer = new Buffer;
+        $buffer
+            ->append('AMQP')
+            ->appendUint8(0)
+            ->appendUint8(0)
+            ->appendUint8(9)
+            ->appendUint8(1);
+
+        $this->connection->write($buffer);
+
+        $this->connectionStart();
+        $this->connectionTune();
+        $this->connectionOpen();
+
+        async(
             function () {
-                if ($this->state !== self::STATE_NOT_CONNECTED) {
-                    throw Exception\ClientException::alreadyConnected();
-                }
-
-                $this->state = self::STATE_CONNECTING;
-
-                $this->connection = new Connection($this->config->uri());
-                $this->connection->once(Connection::EVENT_CLOSE, function(\Throwable $exception = null) {
-                    $this->state = self::STATE_NOT_CONNECTED;
-                    $this->emit(self::EVENT_CLOSE, [$exception]);
-                });
-
-                yield $this->connection->open(
-                    $this->config->timeout,
-                    $this->config->tcpAttempts,
-                    $this->config->tcpNoDelay
-                );
-
+                /** @var Protocol\ConnectionCloseFrame $frame */
+                [$frame] = Future\await([$this->await(Protocol\ConnectionCloseFrame::class)]);
                 $buffer = new Buffer;
                 $buffer
-                    ->append('AMQP')
-                    ->appendUint8(0)
-                    ->appendUint8(0)
-                    ->appendUint8(9)
-                    ->appendUint8(1);
+                    ->appendUint8(1)
+                    ->appendUint16(0)
+                    ->appendUint32(4)
+                    ->appendUint16(10)
+                    ->appendUint16(51)
+                    ->appendUint8(206);
 
-                yield $this->connection->write($buffer);
+                $this->connection->write($buffer);
+                $this->connection->close();
 
-                yield $this->connectionStart();
-                yield $this->connectionTune();
-                yield $this->connectionOpen();
+                $exception = Exception\ClientException::connectionClosed($frame);
 
-                asyncCall(
-                    function () {
-                        /** @var Protocol\ConnectionCloseFrame $frame */
-                        $frame = yield $this->await(Protocol\ConnectionCloseFrame::class);
-                        $buffer = new Buffer;
-                        $buffer
-                            ->appendUint8(1)
-                            ->appendUint16(0)
-                            ->appendUint32(4)
-                            ->appendUint16(10)
-                            ->appendUint16(51)
-                            ->appendUint8(206);
+                $this->disableConnectionMonitor();
 
-                        $this->connection->write($buffer);
-                        $this->connection->close();
+                $this->emit(self::EVENT_CLOSE, [$exception]);
+            }
+        );
 
-                        $exception = Exception\ClientException::connectionClosed($frame);
+        $this->state = self::STATE_CONNECTED;
 
-                        $this->disableConnectionMonitor();
-
-                        $this->emit(self::EVENT_CLOSE, [$exception]);
-                    }
-                );
-
-                $this->state = self::STATE_CONNECTED;
-
-                $this->connectionMonitorWatcherId =  Loop::repeat(
-                    self::CONNECTION_MONITOR_INTERVAL,
-                    function(): void
-                    {
-                        if($this->connection->connected() === false) {
-                            $this->state = self::STATE_NOT_CONNECTED;
-                            $this->emit(self::EVENT_CLOSE, [Exception\ClientException::disconnected()]);
-                        }
-                    }
-                );
+        $this->connectionMonitorWatcherId = EventLoop::repeat(
+            self::CONNECTION_MONITOR_INTERVAL,
+            function(): void
+            {
+                if($this->connection->connected() === false) {
+                    $this->state = self::STATE_NOT_CONNECTED;
+                    $this->emit(self::EVENT_CLOSE, [Exception\ClientException::disconnected()]);
+                }
             }
         );
     }
 
     /**
-     * @return Promise<void>
-     *
      * @throws \PHPinnacle\Ridge\Exception\ClientException
      */
-    public function disconnect(int $code = 0, string $reason = ''): Promise
+    public function disconnect(int $code = 0, string $reason = ''): void
     {
         $this->disableConnectionMonitor();
 
-        return call(
-            function () use ($code, $reason) {
-                try {
-                    if (\in_array($this->state, [self::STATE_NOT_CONNECTED, self::STATE_DISCONNECTING])) {
-                        return;
-                    }
-
-                    if ($this->state !== self::STATE_CONNECTED) {
-                        throw Exception\ClientException::notConnected();
-                    }
-
-                    if($this->connectionMonitorWatcherId !== null){
-                        Loop::cancel($this->connectionMonitorWatcherId);
-
-                        $this->connectionMonitorWatcherId = null;
-                    }
-
-                    $this->state = self::STATE_DISCONNECTING;
-
-                    if ($code === 0) {
-                        $promises = [];
-
-                        foreach ($this->channels as $channel) {
-                            $promises[] = $channel->close($code, $reason);
-                        }
-
-                        // Gracefully continue to close connection even if closing channels fails
-                        yield Promise\any($promises);
-                        $this->channels = [];
-                    }
-
-                    yield $this->connectionClose($code, $reason);
-
-                    $this->connection->close();
-                }
-                finally
-                {
-                    $this->state = self::STATE_NOT_CONNECTED;
-                }
+        try {
+            if (\in_array($this->state, [self::STATE_NOT_CONNECTED, self::STATE_DISCONNECTING])) {
+                return;
             }
-        );
+
+            if ($this->state !== self::STATE_CONNECTED) {
+                throw Exception\ClientException::notConnected();
+            }
+
+            if($this->connectionMonitorWatcherId !== null){
+                EventLoop::cancel($this->connectionMonitorWatcherId);
+
+                $this->connectionMonitorWatcherId = null;
+            }
+
+            $this->state = self::STATE_DISCONNECTING;
+
+            if ($code === 0) {
+                $promises = [];
+
+                foreach ($this->channels as $channel) {
+                    $promises[] = async(fn() => $channel->close($code, $reason));
+                }
+
+                // Gracefully continue to close connection even if closing channels fails
+                Future\awaitAll($promises);
+                $this->channels = [];
+            }
+
+            $this->connectionClose($code, $reason);
+
+            $this->connection->close();
+        }
+        finally
+        {
+            $this->state = self::STATE_NOT_CONNECTED;
+        }
     }
 
     /**
-     * @return Promise<Channel>
-     *
      * @throws \PHPinnacle\Ridge\Exception\ClientException
      */
-    public function channel(): Promise
+    public function channel(): Channel
     {
-        return call(
-            function () {
-                if ($this->state !== self::STATE_CONNECTED) {
-                    throw Exception\ClientException::notConnected();
-                }
+        if ($this->state !== self::STATE_CONNECTED) {
+            throw Exception\ClientException::notConnected();
+        }
 
+        try {
+            $id = $this->findChannelId();
+            $channel = new Channel($id, $this->connection, $this->properties);
+
+            $this->channels[$id] = $channel;
+
+            $channel->open();
+            $channel->qos($this->config->qosSize, $this->config->qosCount, $this->config->qosGlobal);
+
+            async(function () use ($id) {
                 try {
-                    $id = $this->findChannelId();
-                    $channel = new Channel($id, $this->connection, $this->properties);
+                    $frame = yield Future\awaitFirst([
+                        $this->await(Protocol\ChannelCloseFrame::class, $id),
+                        $this->await(Protocol\ChannelCloseOkFrame::class, $id)
+                    ]);
 
-                    $this->channels[$id] = $channel;
+                    $channel = $this->channels[$id];
+                    unset($this->channels[$id]);
 
-                    yield $channel->open();
-                    yield $channel->qos($this->config->qosSize, $this->config->qosCount, $this->config->qosGlobal);
+                    if ($frame instanceof Protocol\ChannelCloseFrame) {
+                        $buffer = new Buffer;
+                        $buffer
+                            ->appendUint8(1)
+                            ->appendUint16($id)
+                            ->appendUint32(4)
+                            ->appendUint16(20)
+                            ->appendUint16(41)
+                            ->appendUint8(206);
 
-                    asyncCall(function () use ($id) {
-                        try {
-                            $frame = yield Promise\first([
-                                $this->await(Protocol\ChannelCloseFrame::class, $id),
-                                $this->await(Protocol\ChannelCloseOkFrame::class, $id)
-                            ]);
-
-                            $channel = $this->channels[$id];
-                            unset($this->channels[$id]);
-
-                            if ($frame instanceof Protocol\ChannelCloseFrame) {
-                                $buffer = new Buffer;
-                                $buffer
-                                    ->appendUint8(1)
-                                    ->appendUint16($id)
-                                    ->appendUint32(4)
-                                    ->appendUint16(20)
-                                    ->appendUint16(41)
-                                    ->appendUint8(206);
-
-                                yield $this->connection->write($buffer);
-                                $channel->forceClose(new ChannelException("Channel closed: {$frame->replyText}"));
-                            }
-                        }
-                        catch (MultiReasonException $exception) {
-                            // There was an error when waiting for those frames
-                            // We should not unset the channel here because the client will clean them up
-                            // with the correct error when the connection close event triggers
-                        }
-
-                        $this->connection->cancel($id);
-                    });
-
-                    return $channel;
+                        $this->connection->write($buffer);
+                        $channel->forceClose(
+                            new ChannelException(sprintf("Channel closed: %s", $frame->replyText))
+                        );
+                    }
+                } catch (CompositeException) {
+                    // There was an error when waiting for those frames
+                    // We should not unset the channel here because the client will clean them up
+                    // with the correct error when the connection close event triggers
                 }
-                catch(ConnectionException $exception) {
-                    $this->state = self::STATE_NOT_CONNECTED;
 
-                    throw $exception;
-                }
-                catch (\Throwable $error) {
-                    throw Exception\ClientException::unexpectedResponse($error);
-                }
-            }
-        );
+                $this->connection->cancel($id);
+            });
+
+            return $channel;
+        } catch(ConnectionException $exception) {
+            $this->state = self::STATE_NOT_CONNECTED;
+
+            throw $exception;
+        } catch (\Throwable $error) {
+            throw Exception\ClientException::unexpectedResponse($error);
+        }
     }
 
     public function isConnected(): bool
@@ -312,147 +272,119 @@ final class Client
     }
 
     /**
-     * @return Promise
-     *
      * @throws \PHPinnacle\Ridge\Exception\ClientException
      */
-    private function connectionStart(): Promise
+    private function connectionStart(): void
     {
-        return call(
-            function () {
-                /** @var Protocol\ConnectionStartFrame $start */
-                $start = yield $this->await(Protocol\ConnectionStartFrame::class);
+        /** @var Protocol\ConnectionStartFrame $start */
+        [$start] = Future\await([$this->await(Protocol\ConnectionStartFrame::class)]);
 
-                if (!\str_contains($start->mechanisms, 'AMQPLAIN')) {
-                    throw Exception\ClientException::notSupported($start->mechanisms);
-                }
+        if (!\str_contains($start->mechanisms, 'AMQPLAIN')) {
+            throw Exception\ClientException::notSupported($start->mechanisms);
+        }
 
-                $this->properties = Properties::create($start->serverProperties);
+        $this->properties = Properties::create($start->serverProperties);
 
-                $buffer = new Buffer;
-                $buffer
-                    ->appendTable([
-                        'LOGIN' => $this->config->user,
-                        'PASSWORD' => $this->config->pass,
-                    ])
-                    ->discard(4);
+        $buffer = new Buffer;
+        $buffer
+            ->appendTable([
+                'LOGIN' => $this->config->user,
+                'PASSWORD' => $this->config->pass,
+            ])
+            ->discard(4);
 
-                $frameBuffer = new Buffer;
-                $frameBuffer
-                    ->appendUint16(10)
-                    ->appendUint16(11)
-                    ->appendTable([])
-                    ->appendString('AMQPLAIN')
-                    ->appendText((string)$buffer)
-                    ->appendString('en_US');
+        $frameBuffer = new Buffer;
+        $frameBuffer
+            ->appendUint16(10)
+            ->appendUint16(11)
+            ->appendTable([])
+            ->appendString('AMQPLAIN')
+            ->appendText((string)$buffer)
+            ->appendString('en_US');
 
-                return $this->connection->method(0, $frameBuffer);
-            }
-        );
+        $this->connection->method(0, $frameBuffer);
     }
 
-    /**
-     * @return Promise
-     */
-    private function connectionTune(): Promise
+    private function connectionTune(): void
     {
-        return call(
-            function () {
-                /** @var Protocol\ConnectionTuneFrame $tune */
-                $tune = yield $this->await(Protocol\ConnectionTuneFrame::class);
+        /** @var Protocol\ConnectionTuneFrame $tune */
+        [$tune] = Future\await([$this->await(Protocol\ConnectionTuneFrame::class)]);
 
-                $heartbeatTimeout = $this->config->heartbeat;
+        $heartbeatTimeout = $this->config->heartbeat;
 
-                if ($heartbeatTimeout !== 0) {
-                    $heartbeatTimeout = \min($heartbeatTimeout, $tune->heartbeat * 1000);
-                }
+        if ($heartbeatTimeout !== 0) {
+            $heartbeatTimeout = \min($heartbeatTimeout, $tune->heartbeat * 1000);
+        }
 
-                $maxChannel = \min($this->config->maxChannel, $tune->channelMax);
-                $maxFrame = \min($this->config->maxFrame, $tune->frameMax);
+        $maxChannel = \min($this->config->maxChannel, $tune->channelMax);
+        $maxFrame = \min($this->config->maxFrame, $tune->frameMax);
 
-                $buffer = new Buffer;
-                $buffer
-                    ->appendUint8(1)
-                    ->appendUint16(0)
-                    ->appendUint32(12)
-                    ->appendUint16(10)
-                    ->appendUint16(31)
-                    ->appendInt16($maxChannel)
-                    ->appendInt32($maxFrame)
-                    ->appendInt16((int) ($heartbeatTimeout / 1000))
-                    ->appendUint8(206);
+        $buffer = new Buffer;
+        $buffer
+            ->appendUint8(1)
+            ->appendUint16(0)
+            ->appendUint32(12)
+            ->appendUint16(10)
+            ->appendUint16(31)
+            ->appendInt16($maxChannel)
+            ->appendInt32($maxFrame)
+            ->appendInt16((int) ($heartbeatTimeout / 1000))
+            ->appendUint8(206);
 
-                yield $this->connection->write($buffer);
+        $this->connection->write($buffer);
 
-                $this->properties->tune($maxChannel, $maxFrame);
+        $this->properties->tune($maxChannel, $maxFrame);
 
-                if ($heartbeatTimeout > 0) {
-                    $this->connection->heartbeat($heartbeatTimeout);
-                }
-            }
-        );
+        if ($heartbeatTimeout > 0) {
+            $this->connection->heartbeat($heartbeatTimeout);
+        }
     }
 
-    /**
-     * @return Promise<Protocol\ConnectionOpenOkFrame>
-     */
-    private function connectionOpen(): Promise
+    private function connectionOpen(): Protocol\ConnectionOpenOkFrame
     {
-        return call(
-            function () {
-                $vhost = $this->config->vhost;
-                $capabilities = '';
-                $insist = false;
+        $vhost = $this->config->vhost;
+        $capabilities = '';
+        $insist = false;
 
-                $buffer = new Buffer;
-                $buffer
-                    ->appendUint8(1)
-                    ->appendUint16(0)
-                    ->appendUint32(7 + \strlen($vhost) + \strlen($capabilities))
-                    ->appendUint16(10)
-                    ->appendUint16(40)
-                    ->appendString($vhost)
-                    ->appendString($capabilities) // TODO: process server capabilities
-                    ->appendBits([$insist])
-                    ->appendUint8(206);
+        $buffer = new Buffer;
+        $buffer
+            ->appendUint8(1)
+            ->appendUint16(0)
+            ->appendUint32(7 + \strlen($vhost) + \strlen($capabilities))
+            ->appendUint16(10)
+            ->appendUint16(40)
+            ->appendString($vhost)
+            ->appendString($capabilities) // TODO: process server capabilities
+            ->appendBits([$insist])
+            ->appendUint8(206);
 
-                yield $this->connection->write($buffer);
+        $this->connection->write($buffer);
 
-                return $this->await(Protocol\ConnectionOpenOkFrame::class);
-            }
-        );
+        [$result] = Future\await([$this->await(Protocol\ConnectionOpenOkFrame::class)]);
+
+        return $result;
     }
 
-    /**
-     * @return Promise
-     */
-    private function connectionClose(int $code, string $reason): Promise
+    private function connectionClose(int $code, string $reason): void
     {
-        return call(
-            function () use ($code, $reason) {
-                $buffer = new Buffer;
-                $buffer
-                    ->appendUint8(1)
-                    ->appendUint16(0)
-                    ->appendUint32(11 + \strlen($reason))
-                    ->appendUint16(10)
-                    ->appendUint16(50)
-                    ->appendInt16($code)
-                    ->appendString($reason)
-                    ->appendInt16(0)
-                    ->appendInt16(0)
-                    ->appendUint8(206);
+        $buffer = new Buffer;
+        $buffer
+            ->appendUint8(1)
+            ->appendUint16(0)
+            ->appendUint32(11 + \strlen($reason))
+            ->appendUint16(10)
+            ->appendUint16(50)
+            ->appendInt16($code)
+            ->appendString($reason)
+            ->appendInt16(0)
+            ->appendInt16(0)
+            ->appendUint8(206);
 
-                yield $this->connection->write($buffer);
+        $this->connection->write($buffer);
 
-                return $this->await(Protocol\ConnectionCloseOkFrame::class);
-            }
-        );
+        Future\await([$this->await(Protocol\ConnectionCloseOkFrame::class)]);
     }
 
-    /**
-     * @return int
-     */
     private function findChannelId(): int
     {
         /** first check in range [next, max] ... */
@@ -479,12 +411,12 @@ final class Client
     /**
      * @template T of Protocol\AbstractFrame
      * @psalm-param class-string<T> $frame
-     * @psalm-return Promise<T>
+     * @psalm-return Future<T>
      */
-    private function await(string $frame, int $channel = 0): Promise
+    private function await(string $frame, int $channel = 0): Future
     {
-        /** @psalm-var Deferred<T> $deferred */
-        $deferred = new Deferred;
+        /** @psalm-var DeferredFuture<T> $deferred */
+        $deferred = new DeferredFuture;
         $this->commandWaitQueue->add($deferred);
 
         $this->connection->subscribe(
@@ -492,19 +424,19 @@ final class Client
             $frame,
             static function (Protocol\AbstractFrame $frame) use ($deferred) {
                 /** @psalm-var T $frame */
-                $deferred->resolve($frame);
+                $deferred->complete($frame);
 
                 return true;
             }
         );
 
-        return $deferred->promise();
+        return $deferred->getFuture();
     }
 
     private function disableConnectionMonitor(): void {
         if($this->connectionMonitorWatcherId !== null) {
 
-            Loop::cancel($this->connectionMonitorWatcherId);
+            EventLoop::cancel($this->connectionMonitorWatcherId);
 
             $this->connectionMonitorWatcherId = null;
         }

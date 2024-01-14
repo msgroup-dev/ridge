@@ -12,7 +12,7 @@ declare(strict_types=1);
 
 namespace PHPinnacle\Ridge;
 
-use function Amp\asyncCall;
+use function Amp\async;
 
 final class MessageReceiver
 {
@@ -21,64 +21,36 @@ final class MessageReceiver
         STATE_HEAD = 1,
         STATE_BODY = 2;
 
-    /**
-     * @var Channel
-     */
-    private $channel;
+    private readonly Buffer $buffer;
 
-    /**
-     * @var Connection
-     */
-    private $connection;
+    private int $state = self::STATE_WAIT;
 
-    /**
-     * @var Buffer
-     */
-    private $buffer;
-
-    /**
-     * @var int
-     */
-    private $state = self::STATE_WAIT;
-
-    /**
-     * @var int
-     */
-    private $remaining = 0;
+    private int $remaining = 0;
 
     /**
      * @var callable[]
      */
-    private $callbacks = [];
+    private array $callbacks = [];
 
-    /**
-     * @var Protocol\BasicDeliverFrame|null
-     */
-    private $deliver;
+    private ?Protocol\BasicDeliverFrame $deliver = null;
 
-    /**
-     * @var Protocol\BasicReturnFrame|null
-     */
-    private $return;
+    private ?Protocol\BasicReturnFrame $return = null;
 
-    /**
-     * @var Protocol\ContentHeaderFrame|null
-     */
-    private $header;
+    private ?Protocol\ContentHeaderFrame $header = null;
 
-    public function __construct(Channel $channel, Connection $connection)
-    {
-        $this->channel = $channel;
-        $this->connection = $connection;
+    public function __construct(
+        private readonly Channel $channel,
+        private readonly Connection $connection
+    ) {
         $this->buffer = new Buffer;
     }
 
     public function start(): void
     {
-        $this->onFrame(Protocol\BasicReturnFrame::class, [$this, 'receiveReturn']);
-        $this->onFrame(Protocol\BasicDeliverFrame::class, [$this, 'receiveDeliver']);
-        $this->onFrame(Protocol\ContentHeaderFrame::class, [$this, 'receiveHeader']);
-        $this->onFrame(Protocol\ContentBodyFrame::class, [$this, 'receiveBody']);
+        $this->onFrame(Protocol\BasicReturnFrame::class, $this->receiveReturn(...));
+        $this->onFrame(Protocol\BasicDeliverFrame::class, $this->receiveDeliver(...));
+        $this->onFrame(Protocol\ContentHeaderFrame::class, $this->receiveHeader(...));
+        $this->onFrame(Protocol\ContentBodyFrame::class, $this->receiveBody(...));
     }
 
     public function stop(): void
@@ -160,26 +132,26 @@ final class MessageReceiver
 
         if ($this->return) {
             $message = new Message(
-                $this->buffer->flush(),
-                $this->return->exchange,
-                $this->return->routingKey,
-                null,
-                null,
-                false,
-                true,
-                $this->header !== null ? $this->header->toArray() : []
+                content: $this->buffer->flush(),
+                exchange: $this->return->exchange,
+                routingKey: $this->return->routingKey,
+                consumerTag: null,
+                deliveryTag: null,
+                redelivered: false,
+                returned: true,
+                headers: $this->header !== null ? $this->header->toArray() : []
             );
         } else {
             if ($this->deliver) {
                 $message = new Message(
-                    $this->buffer->flush(),
-                    $this->deliver->exchange,
-                    $this->deliver->routingKey,
-                    $this->deliver->consumerTag,
-                    $this->deliver->deliveryTag,
-                    $this->deliver->redelivered,
-                    false,
-                    $this->header !== null ? $this->header->toArray() : []
+                    content: $this->buffer->flush(),
+                    exchange: $this->deliver->exchange,
+                    routingKey: $this->deliver->routingKey,
+                    consumerTag: $this->deliver->consumerTag,
+                    deliveryTag: $this->deliver->deliveryTag,
+                    redelivered: $this->deliver->redelivered,
+                    returned: false,
+                    headers: $this->header !== null ? $this->header->toArray() : []
                 );
             } else {
                 throw Exception\ChannelException::frameOrder();
@@ -192,7 +164,7 @@ final class MessageReceiver
 
         foreach ($this->callbacks as $callback) {
             /** @psalm-suppress MixedArgumentTypeCoercion */
-            asyncCall($callback, $message);
+            async($callback, $message);
         }
 
         $this->state = self::STATE_WAIT;

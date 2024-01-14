@@ -18,7 +18,7 @@ final class ClientException extends RidgeException
 {
     public static function unexpectedResponse(\Throwable $error): self
     {
-        return new self('Unexpected response.', (int)$error->getCode(), $error);
+        return new self('Unexpected response.', $error->getCode(), $error);
     }
 
     public static function notConnected(): self
